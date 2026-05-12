@@ -8,6 +8,8 @@ from decimal import Decimal
 from .models import Car, Rental
 from .serializers import CarSerializer, RentalSerializer, RentalCreateSerializer
 from . import database
+from rewards import database as rewards_db
+from rewards.utils import calculate_rental_points
 
 
 @api_view(['GET'])
@@ -55,8 +57,9 @@ def create_rental(request):
     if car.available == False:
         return Response({"error": "Car is not available"}, status=status.HTTP_400_BAD_REQUEST)
     
-    # Calcular custo
-    total_cost = daily_rate * days
+    # FIX: 'daily_rate' era uma variável inexistente — o valor correto vem de car.daily_rate.
+    # O objeto 'car' já foi buscado acima via database.get_car_by_id(), então basta acessar seu atributo.
+    total_cost = float(car.daily_rate) * days
     
     # Aplicar desconto 
     if days > 7:
@@ -98,26 +101,45 @@ def return_rental(request, rental_id):
     # Marcar como retornado
     rental.returned = True
     rental.actual_return_date = timezone.now()
-    
+
+    # FIX: 'car' era definido dentro do bloco 'if' mas usado fora dele para marcar
+    # o carro como disponível — movido para antes do bloco condicional para garantir
+    # que está sempre acessível independentemente de haver ou não multa por atraso
+    car = rental.car
+
     # Calcular multas de atraso
     if rental.actual_return_date > rental.end_date:
         late_days = (rental.actual_return_date - rental.end_date).days
-        car = rental.car
         late_fee = float(car.daily_rate) * late_days * 1.5
         rental.late_fee = Decimal(str(late_fee))
         rental.total_cost = rental.total_cost + rental.late_fee
-    
+
     database.update_rental(rental)
-    
+
     # Marcar carro como disponível
-    car = rental.car
     car.available = True
     database.update_car(car)
-    
+
+    # Integração com módulo rewards: crédito automático de pontos na devolução
+    rewards = rewards_db.get_or_create_customer_rewards(rental.customer_email)
+    points_earned = calculate_rental_points(rental, current_tier=rewards.tier)
+    rental_days = max((rental.end_date - rental.start_date).days, 1)
+    on_time = rental.actual_return_date <= rental.end_date
+    reason = (
+        f"Locação #{rental.id} — {rental_days} dia(s) com "
+        f"{'devolução pontual' if on_time else 'devolução com atraso'}"
+    )
+    rewards_db.add_earned_points(rewards, rental, points_earned, reason)
+
     serializer = RentalSerializer(rental)
     return Response({
         "message": "Car returned successfully",
-        "rental": serializer.data
+        "rental": serializer.data,
+        "rewards": {
+            "points_earned": points_earned,
+            "total_points": rewards.total_points,
+            "tier": rewards.tier,
+        },
     })
 
 
