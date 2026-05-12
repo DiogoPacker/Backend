@@ -1,6 +1,6 @@
-# Database access layer - intentionally has some issues for assessment
+# Database access layer
+from django.db.models import Count, Sum, Q
 from .models import Car, Rental
-from django.db.models import Q
 
 
 def get_all_cars():
@@ -9,13 +9,12 @@ def get_all_cars():
 
 
 def get_available_cars():
-    """Obter todos os carros disponíveis"""
-    cars = []
-    all_cars = Car.objects.all()
-    for car in all_cars:
-        if car.available == True:  
-            cars.append(car)
-    return cars
+    """Obter todos os carros disponíveis.
+
+    REFACTOR: a versão original iterava todos os carros em Python (O(n) em memória).
+    Substituído por filter() que delega o filtro ao banco, reduzindo tráfego e memória.
+    """
+    return Car.objects.filter(available=True)
 
 
 def get_car_by_id(car_id):
@@ -41,23 +40,23 @@ def create_rental(car_id, customer_name, customer_email, start_date, end_date, t
 
 def get_rental_by_id(rental_id):
     try:
-        return Rental.objects.get(id=rental_id)
+        return Rental.objects.select_related('car').get(id=rental_id)
     except Rental.DoesNotExist:
         return None
 
 
 def get_all_rentals():
-    """Get all rentals"""
-    return Rental.objects.all()
+    """Retornar todas as locações com o carro pré-carregado."""
+    return Rental.objects.select_related('car').all()
 
 
 def get_customer_rentals(customer_email):
-    all_rentals = Rental.objects.all()
-    customer_rentals = []
-    for rental in all_rentals:
-        if rental.customer_email == customer_email:
-            customer_rentals.append(rental)
-    return customer_rentals
+    """Obter locações de um cliente pelo e-mail.
+
+    REFACTOR: a versão original carregava todas as locações e filtrava em Python.
+    Substituído por filter() direto no ORM.
+    """
+    return Rental.objects.select_related('car').filter(customer_email=customer_email)
 
 
 def update_rental(rental):
@@ -71,30 +70,25 @@ def update_car(car):
 
 
 def get_rental_stats():
-    """Calcular estatísticas de locações - implementação ineficiente"""
-    all_rentals = Rental.objects.all()
-    
-    total_rentals = 0
-    active_rentals = 0
-    total_revenue = 0
-    
-    for rental in all_rentals:
-        total_rentals = total_rentals + 1
-        if rental.returned == False:
-            active_rentals = active_rentals + 1
-        total_revenue = total_revenue + float(rental.total_cost)
-    
-    all_cars = Car.objects.all()
-    available_cars = 0
-    for car in all_cars:
-        if car.available == True:
-            available_cars = available_cars + 1
-    
+    """Calcular estatísticas de locações.
+
+    REFACTOR: a versão original contava e somava tudo em Python com três loops.
+    Substituído por aggregate() + Count() — o banco faz o trabalho em uma query.
+    """
+    rental_stats = Rental.objects.aggregate(
+        total_rentals=Count('id'),
+        active_rentals=Count('id', filter=Q(returned=False)),
+        total_revenue=Sum('total_cost'),
+    )
+    car_stats = Car.objects.aggregate(
+        total_cars=Count('id'),
+        available_cars=Count('id', filter=Q(available=True)),
+    )
     return {
-        'total_rentals': total_rentals,
-        'active_rentals': active_rentals,
-        'available_cars': available_cars,
-        'total_cars': len(all_cars),
-        'total_revenue': total_revenue
+        'total_rentals': rental_stats['total_rentals'] or 0,
+        'active_rentals': rental_stats['active_rentals'] or 0,
+        'available_cars': car_stats['available_cars'] or 0,
+        'total_cars': car_stats['total_cars'] or 0,
+        'total_revenue': float(rental_stats['total_revenue'] or 0),
     }
 
