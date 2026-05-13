@@ -38,17 +38,29 @@ def get_customer_rewards(customer_email: str) -> CustomerRewards | None:
         return None
 
 
-def get_reward_transactions(customer_email: str):
+def get_reward_transactions(
+    customer_email: str,
+    transaction_type: str | None = None,
+    ordering: str = "-created_at",
+):
     """
-    Retornar o histórico de transações do cliente, mais recentes primeiro.
+    Retornar o histórico de transações do cliente.
+
+    Args:
+        customer_email:   E-mail do cliente.
+        transaction_type: Filtrar por 'earned' ou 'redeemed'. None retorna todos.
+        ordering:         Campo de ordenação ORM (ex: '-created_at', 'created_at').
 
     Usa select_related para evitar query N+1 ao acessar customer_rewards e rental.
     """
-    return (
+    qs = (
         RewardTransaction.objects
         .select_related("customer_rewards", "rental")
         .filter(customer_rewards__customer_email=customer_email)
     )
+    if transaction_type:
+        qs = qs.filter(transaction_type=transaction_type)
+    return qs.order_by(ordering)
 
 
 @transaction.atomic
