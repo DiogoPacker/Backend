@@ -2,12 +2,13 @@
 Testes do app 'rewards'.
 
 Cobre:
-  RewardCalculationTests  — lógica pura: get_car_category, get_customer_tier,
-                             get_points_to_next_tier, calculate_rental_points
-  RewardDatabaseTests     — camada rewards.database (ORM, atomicidade)
-  RewardAPITestCase       — endpoints GET /api/rewards/customer/<email>/
-                             GET /api/rewards/customer/<email>/history/
-                             POST /api/rewards/apply/
+  RewardCalculationTests      — lógica pura: get_car_category, get_customer_tier,
+                                 get_points_to_next_tier, calculate_rental_points
+  RewardDatabaseTests         — camada rewards.database (ORM, atomicidade)
+  RewardAPITestCase           — endpoints GET /api/rewards/customer/<email>/
+                                 GET /api/rewards/customer/<email>/history/
+                                 POST /api/rewards/apply/
+  RewardHistoryFiltersTestCase — paginação, filtragem, ordenação e exportação CSV
 """
 
 from datetime import timedelta
@@ -562,3 +563,214 @@ class RewardAPITestCase(TestCase):
         resp = self.client.get("/api/rewards/customer/maria@test.com/")
         self.assertIn(resp.data["tier"], ("Silver", "Gold"))
         self.assertGreaterEqual(resp.data["total_points"], 500)
+
+
+# ---------------------------------------------------------------------------
+# 4. RewardHistoryFiltersTestCase  — paginação, filtragem, ordenação, CSV
+# ---------------------------------------------------------------------------
+
+class RewardHistoryFiltersTestCase(TestCase):
+    """
+    Testa os recursos opcionais do endpoint GET /history/:
+      - Filtragem por tipo de transação (?type=earned|redeemed)
+      - Ordenação por timestamp (?ordering=timestamp|-timestamp)
+      - Paginação (?page=N&page_size=N)
+      - Exportação CSV (/history/export/)
+    """
+
+    BASE_URL = "/api/rewards/customer/filtros@test.com/history/"
+    EXPORT_URL = "/api/rewards/customer/filtros@test.com/history/export/"
+
+    def setUp(self):
+        self.client = APIClient()
+        self.car = _make_car(daily_rate="600.00", model="Premium")
+        self.rewards = _make_rewards(email="filtros@test.com", points=500, tier="Silver")
+
+        # Cria 3 transações: 2 earned + 1 redeemed
+        rental1 = _make_rental(self.car, days=3, email="filtros@test.com")
+        rental2 = _make_rental(self.car, days=3, email="filtros@test.com")
+        rewards_db.add_earned_points(self.rewards, rental1, 100, "Ganho 1")
+        rewards_db.add_earned_points(self.rewards, rental2, 200, "Ganho 2")
+        rewards_db.redeem_points(self.rewards, rental1, 100)
+
+    # --- filtragem ---
+
+    def test_filter_by_type_earned_returns_only_earned(self):
+        resp = self.client.get(self.BASE_URL, {"type": "earned"})
+        self.assertEqual(resp.status_code, 200)
+        types = [tx["type"] for tx in resp.data["transactions"]]
+        self.assertTrue(all(t == "earned" for t in types))
+        self.assertEqual(len(types), 2)
+
+    def test_filter_by_type_redeemed_returns_only_redeemed(self):
+        resp = self.client.get(self.BASE_URL, {"type": "redeemed"})
+        self.assertEqual(resp.status_code, 200)
+        types = [tx["type"] for tx in resp.data["transactions"]]
+        self.assertTrue(all(t == "redeemed" for t in types))
+        self.assertEqual(len(types), 1)
+
+    def test_filter_invalid_type_returns_400(self):
+        resp = self.client.get(self.BASE_URL, {"type": "invalido"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_no_filter_returns_all_transactions(self):
+        resp = self.client.get(self.BASE_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 3)
+
+    # --- ordenação ---
+
+    def test_default_ordering_is_newest_first(self):
+        resp = self.client.get(self.BASE_URL)
+        timestamps = [tx["timestamp"] for tx in resp.data["transactions"]]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+
+    def test_ordering_timestamp_asc(self):
+        resp = self.client.get(self.BASE_URL, {"ordering": "timestamp"})
+        self.assertEqual(resp.status_code, 200)
+        timestamps = [tx["timestamp"] for tx in resp.data["transactions"]]
+        self.assertEqual(timestamps, sorted(timestamps))
+
+    def test_ordering_timestamp_desc(self):
+        resp = self.client.get(self.BASE_URL, {"ordering": "-timestamp"})
+        self.assertEqual(resp.status_code, 200)
+        timestamps = [tx["timestamp"] for tx in resp.data["transactions"]]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+
+    def test_invalid_ordering_falls_back_to_default(self):
+        """Parâmetro de ordenação desconhecido deve usar o padrão (-created_at)."""
+        resp = self.client.get(self.BASE_URL, {"ordering": "campo_invalido"})
+        self.assertEqual(resp.status_code, 200)
+        # Apenas verifica que retornou sem erro
+        self.assertIn("transactions", resp.data)
+
+    # --- paginação ---
+
+    def test_pagination_metadata_keys_present(self):
+        resp = self.client.get(self.BASE_URL)
+        for key in ("count", "total_pages", "page", "page_size", "transactions"):
+            self.assertIn(key, resp.data)
+
+    def test_pagination_page_size_1_returns_one_item(self):
+        resp = self.client.get(self.BASE_URL, {"page_size": 1})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["transactions"]), 1)
+        self.assertEqual(resp.data["count"], 3)
+        self.assertEqual(resp.data["total_pages"], 3)
+
+    def test_pagination_page_2_returns_correct_item(self):
+        resp = self.client.get(self.BASE_URL, {"page_size": 1, "page": 2})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["transactions"]), 1)
+        self.assertEqual(resp.data["page"], 2)
+
+    def test_pagination_out_of_range_returns_last_page(self):
+        resp = self.client.get(self.BASE_URL, {"page": 9999, "page_size": 10})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("transactions", resp.data)
+
+    def test_pagination_page_size_capped_at_100(self):
+        resp = self.client.get(self.BASE_URL, {"page_size": 9999})
+        self.assertEqual(resp.status_code, 200)
+        self.assertLessEqual(resp.data["page_size"], 100)
+
+    def test_pagination_invalid_page_size_uses_default(self):
+        resp = self.client.get(self.BASE_URL, {"page_size": "abc"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["page_size"], 20)
+
+    # --- exportação CSV ---
+
+    def test_csv_export_returns_200(self):
+        resp = self.client.get(self.EXPORT_URL)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_csv_export_content_type_is_csv(self):
+        resp = self.client.get(self.EXPORT_URL)
+        self.assertIn("text/csv", resp["Content-Type"])
+
+    def test_csv_export_has_content_disposition(self):
+        resp = self.client.get(self.EXPORT_URL)
+        self.assertIn("attachment", resp["Content-Disposition"])
+        self.assertIn("filtros@test.com", resp["Content-Disposition"])
+
+    def test_csv_export_has_header_row(self):
+        resp = self.client.get(self.EXPORT_URL)
+        lines = resp.content.decode("utf-8").strip().splitlines()
+        self.assertEqual(lines[0], "id,type,points,reason,rental_id,timestamp")
+
+    def test_csv_export_row_count_matches_transactions(self):
+        resp = self.client.get(self.EXPORT_URL)
+        lines = resp.content.decode("utf-8").strip().splitlines()
+        # 1 cabeçalho + 3 transações
+        self.assertEqual(len(lines), 4)
+
+    def test_csv_export_filter_by_type(self):
+        resp = self.client.get(self.EXPORT_URL, {"type": "earned"})
+        self.assertEqual(resp.status_code, 200)
+        lines = resp.content.decode("utf-8").strip().splitlines()
+        # 1 cabeçalho + 2 earned
+        self.assertEqual(len(lines), 3)
+
+    def test_csv_export_nonexistent_customer_returns_404(self):
+        resp = self.client.get(
+            "/api/rewards/customer/naoexiste@test.com/history/export/"
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # --- exportação PDF ---
+
+    def test_pdf_export_returns_200(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_pdf_export_content_type_is_pdf(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf"})
+        self.assertEqual(resp["Content-Type"], "application/pdf")
+
+    def test_pdf_export_has_content_disposition(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf"})
+        self.assertIn("attachment", resp["Content-Disposition"])
+        self.assertIn("filtros@test.com", resp["Content-Disposition"])
+        self.assertIn(".pdf", resp["Content-Disposition"])
+
+    def test_pdf_export_body_is_non_empty(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf"})
+        self.assertGreater(len(resp.content), 100)  # PDF não pode ser vazio
+
+    def test_pdf_export_starts_with_pdf_magic_bytes(self):
+        """Arquivo gerado deve ser um PDF válido (magic bytes %PDF)."""
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf"})
+        self.assertTrue(resp.content.startswith(b"%PDF"))
+
+    def test_pdf_export_filter_by_type_earned(self):
+        """PDF filtrado por 'earned' deve ser gerado sem erro."""
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf", "type": "earned"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp["Content-Type"], "application/pdf")
+
+    def test_pdf_export_filter_by_type_redeemed(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf", "type": "redeemed"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_pdf_export_invalid_type_returns_400(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "pdf", "type": "invalido"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_pdf_export_nonexistent_customer_returns_404(self):
+        resp = self.client.get(
+            "/api/rewards/customer/naoexiste@test.com/history/export/",
+            {"export_format": "pdf"},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_invalid_export_format_returns_400(self):
+        resp = self.client.get(self.EXPORT_URL, {"export_format": "xlsx"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.data)
+
+    def test_default_export_format_is_csv(self):
+        """Sem ?export_format= deve retornar CSV (retrocompatibilidade)."""
+        resp = self.client.get(self.EXPORT_URL)
+        self.assertIn("text/csv", resp["Content-Type"])
+
