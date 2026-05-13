@@ -13,7 +13,7 @@ Foi implementado um **sistema completo de pontos de recompensa** integrado ao fl
 - Endpoints REST para consulta de saldo, histórico e resgate
 - Painel admin completo
 - Correção de bugs e refatorações no código original
-- 119 testes automatizados, todos passando
+- 151 testes automatizados, todos passando
 
 ---
 
@@ -133,14 +133,34 @@ As regras são aplicadas **nesta ordem**:
 | `GET` | `/api/rentals/customer/<email>/` | Locações de um cliente |
 | `GET` | `/api/stats/` | Estatísticas gerais |
 | `GET` | `/api/rewards/customer/<email>/` | Saldo e nível do cliente |
-| `GET` | `/api/rewards/customer/<email>/history/` | Histórico de transações |
+| `GET` | `/api/rewards/customer/<email>/history/` | Histórico de transações (paginação, filtragem, ordenação) |
+| `GET` | `/api/rewards/customer/<email>/history/export/` | Exportar histórico como CSV ou PDF |
 | `POST` | `/api/rewards/apply/` | Resgatar pontos como desconto |
+
+#### Query params de `/history/`
+
+| Parâmetro | Valores aceitos | Padrão | Descrição |
+|-----------|-----------------|--------|-----------|
+| `type` | `earned`, `redeemed` | — | Filtrar por tipo de transação |
+| `ordering` | `timestamp`, `-timestamp` | `-timestamp` | Ordenação por data |
+| `page` | inteiro positivo | `1` | Número da página |
+| `page_size` | 1–100 | `20` | Itens por página |
+
+#### Query params de `/history/export/`
+
+| Parâmetro | Valores aceitos | Padrão | Descrição |
+|-----------|-----------------|--------|-----------|
+| `export_format` | `csv`, `pdf` | `csv` | Formato do arquivo gerado |
+| `type` | `earned`, `redeemed` | — | Filtrar por tipo de transação |
+| `ordering` | `timestamp`, `-timestamp` | `-timestamp` | Ordenação por data |
+
+> **Nota:** usa `export_format` em vez de `format` porque `format` é um parâmetro reservado pelo DRF para negociação de conteúdo.
 
 ---
 
 ## 7. Testes
 
-**119 testes, 0 falhas.** Tempo de execução: ~1.5s.
+**151 testes, 0 falhas.** Tempo de execução: ~1.5s.
 
 ### Distribuição por arquivo e classe
 
@@ -153,6 +173,7 @@ As regras são aplicadas **nesta ordem**:
 | `rewards/tests.py` | `RewardCalculationTests` | 29 | Cada regra isolada: categoria, tier, pontos_to_next, cenários FEATURE.md |
 | `rewards/tests.py` | `RewardDatabaseTests` | 14 | get_or_create, add_earned, redeem, atomicidade, histórico |
 | `rewards/tests.py` | `RewardAPITestCase` | 34 | Todos os endpoints, casos de erro, upgrade de tier |
+| `rewards/tests.py` | `RewardHistoryFiltersTestCase` | 32 | Filtragem, ordenação, paginação, exportação CSV e PDF |
 
 ### Estratégia
 
@@ -184,7 +205,7 @@ python manage.py test rewards --verbosity=2
 pytest
 ```
 
-Resultado esperado: **119 passed, 0 failed**.
+Resultado esperado: **151 passed, 0 failed**.
 
 ### Servidor local
 
@@ -211,13 +232,42 @@ curl -X POST http://localhost:8000/api/rentals/1/return/
 # 4. Consultar saldo (235 pts para carro premium 8 dias Bronze)
 curl http://localhost:8000/api/rewards/customer/joao@example.com/
 
-# 5. Histórico de transações
+# 5. Histórico de transações (todos)
 curl http://localhost:8000/api/rewards/customer/joao@example.com/history/
+
+# 5a. Histórico filtrado — apenas pontos ganhos
+curl "http://localhost:8000/api/rewards/customer/joao@example.com/history/?type=earned"
+
+# 5b. Histórico filtrado — apenas resgates
+curl "http://localhost:8000/api/rewards/customer/joao@example.com/history/?type=redeemed"
+
+# 5c. Histórico com paginação — página 1, 5 itens por página
+curl "http://localhost:8000/api/rewards/customer/joao@example.com/history/?page=1&page_size=5"
+
+# 5d. Histórico com ordenação crescente (mais antigos primeiro)
+curl "http://localhost:8000/api/rewards/customer/joao@example.com/history/?ordering=timestamp"
+
+# 5e. Exportar histórico completo como CSV
+curl -o historico.csv http://localhost:8000/api/rewards/customer/joao@example.com/history/export/
+
+# 5f. Exportar apenas os resgates como CSV
+curl -o resgates.csv "http://localhost:8000/api/rewards/customer/joao@example.com/history/export/?type=redeemed"
+
+# 5g. Exportar histórico completo como PDF
+curl -o historico.pdf "http://localhost:8000/api/rewards/customer/joao@example.com/history/export/?export_format=pdf"
+
+# 5h. Exportar apenas os pontos ganhos como PDF
+curl -o ganhos.pdf "http://localhost:8000/api/rewards/customer/joao@example.com/history/export/?export_format=pdf&type=earned"
 
 # 6. Resgatar 100 pontos (= R$50 de desconto)
 curl -X POST http://localhost:8000/api/rewards/apply/ \
   -H "Content-Type: application/json" \
   -d '{"rental_id": 1, "customer_email": "joao@example.com", "points_to_redeem": 100}'
+
+# 7. Resgatar 200 pontos (= R$100 de desconto)
+curl -X POST http://localhost:8000/api/rewards/apply/ \
+  -H "Content-Type: application/json" \
+  -d '{"rental_id": 1, "customer_email": "joao@example.com", "points_to_redeem": 200}'
 ```
 
 ### Admin Django
@@ -253,10 +303,8 @@ python init_data.py
 
 ## 10. O Que Melhoraria com Mais Tempo
 
-- **Paginação no histórico**: com muitas locações, `/history/` pode retornar centenas de registros. Adicionaria `PageNumberPagination` do DRF.
 - **Modelo `Customer` com UUID**: vincular ao e-mail é frágil — um cliente que muda o e-mail perde o histórico. Um `Customer` com UUID resolveria isso de forma robusta.
 - **Índice composto em `RewardTransaction`**: `(customer_rewards_id, created_at)` para queries de histórico com filtro por data.
 - **Expiração de pontos**: em programas reais, pontos têm validade. Adicionaria `expires_at` em `RewardTransaction` e uma tarefa Celery periódica.
 - **Testes de concorrência**: o `@transaction.atomic` protege contra race conditions simples, mas testes com threads paralelas validariam o comportamento sob carga real.
-- **Exportação de histórico**: CSV/PDF mencionado como opcional no FEATURE.md.
 
